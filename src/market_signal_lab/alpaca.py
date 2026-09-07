@@ -58,7 +58,7 @@ class AlpacaMarketDataClient:
                 "Accept": "application/json",
                 "APCA-API-KEY-ID": self.credentials.key_id,
                 "APCA-API-SECRET-KEY": self.credentials.secret_key,
-                "User-Agent": "MarketSignalLab/1.0",
+                "User-Agent": "MarketSignalLab/1.1",
             },
         )
         for attempt in range(self.max_retries + 1):
@@ -78,20 +78,23 @@ class AlpacaMarketDataClient:
                 time.sleep(min(2**attempt, 10))
         raise RuntimeError("Alpaca request failed")
 
-    def fetch_daily_bars(
+    def fetch_bars(
         self,
         symbols: list[str],
         *,
         start: str | date,
         end: str | date,
+        timeframe: str,
         feed: str = "iex",
         adjustment: str = "all",
         batch_size: int = 50,
     ) -> pd.DataFrame:
-        """Download paginated daily bars for one or more symbols."""
+        """Download paginated bars for one or more symbols."""
         normalized = sorted({symbol.strip().upper() for symbol in symbols if symbol.strip()})
         if not normalized:
             raise ValueError("At least one ticker symbol is required")
+        if timeframe not in {"1Min", "1Day"}:
+            raise ValueError("Timeframe must be 1Min or 1Day")
         if feed not in {"iex", "sip", "otc"}:
             raise ValueError("Feed must be iex, sip, or otc")
         if batch_size < 1 or batch_size > 200:
@@ -105,7 +108,7 @@ class AlpacaMarketDataClient:
             while True:
                 parameters: dict[str, str | int] = {
                     "symbols": ",".join(batch),
-                    "timeframe": "1Day",
+                    "timeframe": timeframe,
                     "start": str(start),
                     "end": str(end),
                     "limit": 10_000,
@@ -162,3 +165,45 @@ class AlpacaMarketDataClient:
                 ["ticker", "timestamp"], keep="last"
             )
         return frame.reset_index(drop=True)
+
+    def fetch_daily_bars(
+        self,
+        symbols: list[str],
+        *,
+        start: str | date,
+        end: str | date,
+        feed: str = "iex",
+        adjustment: str = "all",
+        batch_size: int = 50,
+    ) -> pd.DataFrame:
+        """Download paginated daily bars for one or more symbols."""
+        return self.fetch_bars(
+            symbols,
+            start=start,
+            end=end,
+            timeframe="1Day",
+            feed=feed,
+            adjustment=adjustment,
+            batch_size=batch_size,
+        )
+
+    def fetch_minute_bars(
+        self,
+        symbols: list[str],
+        *,
+        start: str | date,
+        end: str | date,
+        feed: str = "iex",
+        adjustment: str = "all",
+        batch_size: int = 50,
+    ) -> pd.DataFrame:
+        """Download paginated one-minute bars for one or more symbols."""
+        return self.fetch_bars(
+            symbols,
+            start=start,
+            end=end,
+            timeframe="1Min",
+            feed=feed,
+            adjustment=adjustment,
+            batch_size=batch_size,
+        )

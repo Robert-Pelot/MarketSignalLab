@@ -75,8 +75,21 @@ class AlpacaClientTests(unittest.TestCase):
         first_request = mocked_open.call_args_list[0].args[0]
         second_request = mocked_open.call_args_list[1].args[0]
         self.assertNotIn("example-secret", first_request.full_url)
+        self.assertIn("timeframe=1Day", first_request.full_url)
         self.assertIn("page_token=next-token", second_request.full_url)
         self.assertEqual(first_request.get_header("Apca-api-secret-key"), "example-secret")
+
+    @patch("market_signal_lab.alpaca.urlopen")
+    def test_minute_download_requests_one_minute_timeframe(self, mocked_open):
+        mocked_open.return_value = _FakeResponse({"bars": {}, "next_page_token": None})
+        credentials = AlpacaCredentials("example-key", "example-secret")
+        result = AlpacaMarketDataClient(credentials).fetch_minute_bars(
+            ["AAPL"], start="2026-01-01", end="2026-01-03", feed="sip"
+        )
+        self.assertTrue(result.empty)
+        request = mocked_open.call_args.args[0]
+        self.assertIn("timeframe=1Min", request.full_url)
+        self.assertIn("feed=sip", request.full_url)
 
 
 if __name__ == "__main__":

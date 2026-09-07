@@ -32,7 +32,7 @@ backtesting practices—not to operate a brokerage account.
 - Component-level scoring that explains each combined signal
 - Long-only backtesting with next-bar execution and configurable costs
 - Deterministic synthetic data for an entirely offline demonstration
-- Automated tests and GitHub Actions on Python 3.11 and 3.12
+- Automated tests and GitHub Actions on Python 3.11, 3.12, and 3.13
 
 ## Quick start
 
@@ -139,11 +139,15 @@ MarketSignalLab can extend the daily archive using Alpaca's read-only Historical
 Bars endpoint. The code does not import Alpaca's trading API and cannot submit an
 order.
 
-Set the regenerated credentials only in the current PowerShell session:
+Set credentials only in the current PowerShell session. `Read-Host` prevents
+their values from appearing on screen or in PowerShell command history:
 
 ```powershell
-$env:APCA_API_KEY_ID = "your-new-key-id"
-$env:APCA_API_SECRET_KEY = "your-new-secret-key"
+$KeySecure = Read-Host "Enter Alpaca API key ID" -AsSecureString
+$SecretSecure = Read-Host "Enter Alpaca secret key" -AsSecureString
+$env:APCA_API_KEY_ID = [Net.NetworkCredential]::new("", $KeySecure).Password
+$env:APCA_API_SECRET_KEY = [Net.NetworkCredential]::new("", $SecretSecure).Password
+Remove-Variable KeySecure, SecretSecure
 ```
 
 Test a few symbols first:
@@ -175,12 +179,71 @@ responses are retried.
 The default `iex` feed is appropriate for initial use without a paid market-data
 subscription, but it represents only the IEX exchange and therefore does not
 provide complete US market volume. See Alpaca's
-[Historical Stock Data documentation](https://docs.alpaca.markets/docs/historical-stock-data-1)
+[Historical Stock Data documentation](https://docs.alpaca.markets/us/docs/historical-stock-data-1)
 for the feed differences and subscription requirements.
 
 The DuckDB file is a generated local data asset and is excluded from GitHub.
 Keep a backup on the NAS, but avoid opening one writable database concurrently
 from multiple computers.
+
+### Backfill one-minute bars
+
+The daily updater is useful for daily signals, but it does not replace the
+original project's high-resolution collection goal. A separate resumable
+backfill stores Alpaca one-minute bars without mixing them into the legacy raw
+table or the curated daily table.
+
+Start with a short, three-symbol SIP test:
+
+```powershell
+python -m market_signal_lab archive-backfill-minutes `
+  "D:\MarketData\market-history.duckdb" `
+  --symbols AAPL,MSFT,NVDA `
+  --start 2026-08-31 `
+  --end 2026-09-06 `
+  --feed sip
+```
+
+Inspect the result:
+
+```powershell
+python -m market_signal_lab archive-minute-info `
+  "D:\MarketData\market-history.duckdb"
+```
+
+After validating a small range, backfill every symbol already represented in
+the archive:
+
+```powershell
+python -m market_signal_lab archive-backfill-minutes `
+  "D:\MarketData\market-history.duckdb" `
+  --all-symbols `
+  --start 2024-08-31 `
+  --feed sip `
+  --batch-size 50 `
+  --chunk-days 7
+```
+
+Each symbol/date chunk is downloaded, validated, and committed separately. If
+the process is interrupted, repeat the same command; completed chunks, including
+valid requests that returned no bars, are skipped. Keeping the same start date,
+end date, feed, batch size, and chunk size gives the most efficient resume.
+
+One-minute history for thousands of symbols can require hundreds of millions of
+rows, many API pages, and tens of gigabytes. Keep the computer awake, retain a
+pre-backfill database backup, and use only one writer. The application requests
+explicit New York date boundaries and follows every Alpaca pagination token.
+
+The one-minute layer is intentionally separate:
+
+- `provider_minute_bars` stores validated SIP/IEX/OTC OHLCV bars.
+- `provider_minute_coverage` records completed symbol/date chunks for restart.
+- `provider_minute_update_log` records committed batch totals.
+- `daily_prices` remains the stable input for the existing daily analysis.
+
+Later versions can derive consistent 5-minute, 15-minute, hourly, and daily
+features from the one-minute layer and can append live bars from a WebSocket
+collector.
 
 ### Verified legacy snapshot
 
@@ -230,6 +293,32 @@ The implementation remains intentionally limited: it does not model bid/ask
 spread, market impact, dividends, taxes, partial fills, short selling, or changing
 liquidity. Past simulated performance does not predict future results.
 
+## Prediction research roadmap
+
+The current score is an explainable heuristic, not a claim that future movement
+has been predicted. A defensible prediction experiment will define both a time
+horizon and a target before model selection—for example, whether the return over
+the next 5, 15, 30, or 60 minutes exceeds a cost-aware threshold.
+
+Evaluation must remain chronological:
+
+1. Train on an earlier rolling window, initially six to twelve months.
+2. Select settings on the next validation period.
+3. Predict a later month that neither training nor tuning has seen.
+4. Move the window forward and repeat across multiple market conditions.
+5. Reserve the newest period as a final untouched test.
+
+Raw directional accuracy is not enough. Results should also report class
+balance, precision and recall, probability calibration, return after costs,
+maximum drawdown, turnover, and performance versus simple baselines. An
+unexpectedly high accuracy is treated as a reason to check for look-ahead bias,
+target leakage, duplicate timestamps, or survivorship bias.
+
+The 2023–2024 legacy data remains valuable for daily experiments and historical
+context. Because its minute, five-minute, and hourly rows are not labeled by
+interval, one-minute models should be trained and tested on the consistent Alpaca
+minute layer rather than pretending the legacy rows have uniform granularity.
+
 ## Project layout
 
 ```text
@@ -258,14 +347,16 @@ python -m compileall -q src tests
 python -m unittest discover -s tests -v
 ```
 
-The tests cover archive migration from folders and ZIP files, indicator
-calculations, signal warm-up and repeatability, input validation, next-bar
-execution, transaction costs, CSV round trips, and the CLI.
+The tests cover archive migration from folders and ZIP files, resumable minute
+backfills, Alpaca pagination and timeframe selection, indicator calculations,
+signal warm-up and repeatability, input validation, next-bar execution,
+transaction costs, CSV round trips, and the CLI.
 
 ## Security
 
-This repository deliberately contains no brokerage integration and needs no
-credentials. See [SECURITY.md](SECURITY.md) for the credential-handling policy.
+This repository deliberately contains no order-placement integration. Optional
+read-only market-data updates load credentials from the process environment. See
+[SECURITY.md](SECURITY.md) for the credential-handling policy.
 
 ## License
 

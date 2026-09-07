@@ -2,9 +2,10 @@
 
 ## Credentials
 
-MarketSignalLab does not require brokerage credentials and does not place trades.
-Never add API keys, access tokens, passwords, account identifiers, or `.env` files
-to this repository.
+MarketSignalLab's offline demo and analysis do not require credentials. Optional
+Alpaca historical-data updates require API credentials, but the application does
+not contain order-placement endpoints or place trades. Never add API keys, access
+tokens, passwords, account identifiers, or `.env` files to this repository.
 
 For archive updates, the application reads `APCA_API_KEY_ID` and
 `APCA_API_SECRET_KEY` from the process environment. It sends them only as the

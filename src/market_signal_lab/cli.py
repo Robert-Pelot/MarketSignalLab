@@ -20,6 +20,11 @@ from market_signal_lab.archive import (
 )
 from market_signal_lab.backtest import BacktestResult, run_backtest
 from market_signal_lab.demo import generate_demo_prices
+from market_signal_lab.intraday import (
+    MinuteBackfillProgress,
+    backfill_minute_bars,
+    minute_archive_statistics,
+)
 from market_signal_lab.io import load_prices, save_csv
 
 
@@ -67,6 +72,32 @@ def _build_parser() -> argparse.ArgumentParser:
     update.add_argument("--end", help="Inclusive YYYY-MM-DD; defaults to today")
     update.add_argument("--feed", choices=("iex", "sip", "otc"), default="iex")
     update.add_argument("--batch-size", type=int, default=50)
+
+    minute_backfill = subparsers.add_parser(
+        "archive-backfill-minutes",
+        help="Download Alpaca one-minute bars with resumable checkpoints",
+    )
+    minute_backfill.add_argument("database", type=Path)
+    minute_selection = minute_backfill.add_mutually_exclusive_group(required=True)
+    minute_selection.add_argument("--symbols", help="Comma-separated ticker symbols")
+    minute_selection.add_argument(
+        "--all-symbols",
+        action="store_true",
+        help="Backfill every symbol already in the archive",
+    )
+    minute_backfill.add_argument("--start", required=True, help="Inclusive YYYY-MM-DD")
+    minute_backfill.add_argument(
+        "--end",
+        help="Inclusive YYYY-MM-DD; defaults to the last completed calendar day",
+    )
+    minute_backfill.add_argument("--feed", choices=("iex", "sip", "otc"), default="iex")
+    minute_backfill.add_argument("--batch-size", type=int, default=50)
+    minute_backfill.add_argument("--chunk-days", type=int, default=7)
+
+    minute_info = subparsers.add_parser(
+        "archive-minute-info", help="Show one-minute archive counts and coverage"
+    )
+    minute_info.add_argument("database", type=Path)
 
     archive_analyze = subparsers.add_parser(
         "archive-analyze", help="Analyze one ticker from an archive database"
@@ -154,6 +185,56 @@ def main(argv: Sequence[str] | None = None) -> int:
             merged = merge_provider_daily_bars(arguments.database, bars)
             print(f"Rows merged:          {merged['rows_merged']:,}")
             print(f"Symbols updated:      {merged['symbols_updated']:,}")
+            return 0
+        if arguments.command == "archive-backfill-minutes":
+            credentials = AlpacaCredentials.from_environment()
+            symbols = (
+                list_archive_symbols(arguments.database)
+                if arguments.all_symbols
+                else arguments.symbols.split(",")
+            )
+            end = arguments.end or (date.today() - timedelta(days=1)).isoformat()
+            print(
+                f"Backfilling one-minute {arguments.feed.upper()} bars for "
+                f"{len(symbols):,} symbols: {arguments.start} through {end}"
+            )
+
+            def minute_progress(item: MinuteBackfillProgress) -> None:
+                if item.position == 1 or item.position % 10 == 0 or item.position == item.total:
+                    state = "already complete" if item.skipped else f"{item.rows:,} rows"
+                    print(
+                        f"Job {item.position:,}/{item.total:,}: {item.start} through "
+                        f"{item.end}; {item.symbol_count:,} symbols; {state}"
+                    )
+
+            result = backfill_minute_bars(
+                arguments.database,
+                symbols,
+                AlpacaMarketDataClient(credentials),
+                start=arguments.start,
+                end=end,
+                feed=arguments.feed,
+                batch_size=arguments.batch_size,
+                chunk_days=arguments.chunk_days,
+                progress=minute_progress,
+            )
+            print(f"Jobs completed:       {result.jobs_completed:,}")
+            print(f"Jobs skipped:         {result.jobs_skipped:,}")
+            print(f"Rows merged:          {result.rows_merged:,}")
+            print(f"Symbols updated:      {result.symbols_updated:,}")
+            return 0
+        if arguments.command == "archive-minute-info":
+            statistics = minute_archive_statistics(arguments.database)
+            print(f"Minute rows:          {statistics['rows']:,}")
+            print(f"Symbols:              {statistics['symbols']:,}")
+            date_range = (
+                f"{statistics['first_timestamp']} through {statistics['last_timestamp']}"
+                if statistics["first_timestamp"]
+                else "not started"
+            )
+            print(f"Timestamp range:      {date_range}")
+            print(f"Coverage records:     {statistics['coverage_records']:,}")
+            print(f"Database size:        {statistics['database_bytes'] / 1024**3:.2f} GiB")
             return 0
         if arguments.command == "demo":
             prices = generate_demo_prices(rows=arguments.rows, seed=arguments.seed)
