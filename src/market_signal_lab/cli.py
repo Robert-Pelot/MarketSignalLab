@@ -1,0 +1,184 @@
+"""Command-line interface for MarketSignalLab."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+from datetime import date, timedelta
+from pathlib import Path
+
+from market_signal_lab.alpaca import AlpacaCredentials, AlpacaMarketDataClient
+from market_signal_lab.analysis import analyze_prices
+from market_signal_lab.archive import (
+    archive_statistics,
+    build_archive,
+    inspect_legacy_archive,
+    list_archive_symbols,
+    load_daily_prices,
+    merge_provider_daily_bars,
+    next_update_start,
+)
+from market_signal_lab.backtest import BacktestResult, run_backtest
+from market_signal_lab.demo import generate_demo_prices
+from market_signal_lab.io import load_prices, save_csv
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="market-signal-lab",
+        description="Analyze OHLCV prices and run an educational next-bar backtest.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    demo = subparsers.add_parser("demo", help="Run an offline demonstration")
+    demo.add_argument("--rows", type=int, default=260, help="Number of synthetic daily bars")
+    demo.add_argument("--seed", type=int, default=42, help="Random seed for repeatability")
+    demo.add_argument("--output", type=Path, help="Optional analysis CSV destination")
+    _add_backtest_arguments(demo)
+
+    analyze = subparsers.add_parser("analyze", help="Analyze an OHLCV CSV file")
+    analyze.add_argument(
+        "csv_file", type=Path, help="CSV containing Date/Open/High/Low/Close/Volume"
+    )
+    analyze.add_argument("--output", type=Path, default=Path("reports/analysis.csv"))
+    _add_backtest_arguments(analyze)
+
+    inspect = subparsers.add_parser("archive-inspect", help="Inspect a legacy directory or ZIP")
+    inspect.add_argument("source", type=Path)
+
+    build = subparsers.add_parser("archive-build", help="Build a DuckDB market-data archive")
+    build.add_argument("source", type=Path, help="Legacy data directory or ZIP")
+    build.add_argument("database", type=Path, help="Destination .duckdb file")
+    build.add_argument("--replace", action="store_true", help="Replace an existing database")
+
+    info = subparsers.add_parser("archive-info", help="Show statistics for an archive database")
+    info.add_argument("database", type=Path)
+
+    update = subparsers.add_parser(
+        "archive-update", help="Download read-only Alpaca daily bars into an archive"
+    )
+    update.add_argument("database", type=Path)
+    selection = update.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--symbols", help="Comma-separated ticker symbols")
+    selection.add_argument(
+        "--all-symbols", action="store_true", help="Update every symbol already in the archive"
+    )
+    update.add_argument("--start", help="Inclusive YYYY-MM-DD; defaults after newest archive date")
+    update.add_argument("--end", help="Inclusive YYYY-MM-DD; defaults to today")
+    update.add_argument("--feed", choices=("iex", "sip", "otc"), default="iex")
+    update.add_argument("--batch-size", type=int, default=50)
+
+    archive_analyze = subparsers.add_parser(
+        "archive-analyze", help="Analyze one ticker from an archive database"
+    )
+    archive_analyze.add_argument("database", type=Path)
+    archive_analyze.add_argument("ticker")
+    archive_analyze.add_argument("--start")
+    archive_analyze.add_argument("--end")
+    archive_analyze.add_argument("--output", type=Path)
+    _add_backtest_arguments(archive_analyze)
+    return parser
+
+
+def _add_backtest_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--initial-cash", type=float, default=10_000.0)
+    parser.add_argument("--transaction-cost-bps", type=float, default=5.0)
+
+
+def _print_summary(result: BacktestResult, latest_signal: str, latest_score: int) -> None:
+    print("MarketSignalLab result")
+    print(f"Latest signal:        {latest_signal} (score {latest_score:+d})")
+    print(f"Initial cash:         ${result.metrics['initial_cash']:,.2f}")
+    print(f"Final equity:         ${result.metrics['final_equity']:,.2f}")
+    print(f"Strategy return:      {result.metrics['total_return_pct']:+.2f}%")
+    print(f"Buy-and-hold return:  {result.metrics['buy_and_hold_return_pct']:+.2f}%")
+    print(f"Executed trades:      {result.metrics['trade_count']}")
+    print("Educational use only; this is not financial advice.")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    arguments = parser.parse_args(argv)
+    try:
+        if arguments.command == "archive-inspect":
+            inspection = inspect_legacy_archive(arguments.source)
+            print(f"Price files:          {inspection.price_file_count:,}")
+            print(f"Uncompressed size:    {inspection.uncompressed_bytes / 1024**3:.2f} GiB")
+            return 0
+        if arguments.command == "archive-build":
+
+            def progress(position: int, total: int, ticker: str) -> None:
+                if position == 1 or position % 100 == 0 or position == total:
+                    print(f"Importing {position:,}/{total:,}: {ticker}")
+
+            result = build_archive(
+                arguments.source,
+                arguments.database,
+                replace=arguments.replace,
+                progress=progress,
+            )
+            print(f"Archive created:      {result.database}")
+            print(f"Files imported:       {result.files_imported:,}")
+            print(f"Validated rows:       {result.rows_imported:,}")
+            print(f"Rejected rows:        {result.rows_rejected:,}")
+            print(f"Symbols:              {result.symbols:,}")
+            print(f"Daily bars:           {result.daily_rows:,}")
+            return 0
+        if arguments.command == "archive-info":
+            statistics = archive_statistics(arguments.database)
+            print(f"Symbols:              {statistics['symbols']:,}")
+            print(f"Raw rows:             {statistics['raw_rows']:,}")
+            print(f"Daily bars:           {statistics['daily_rows']:,}")
+            date_range = f"{statistics['first_date']} through {statistics['last_date']}"
+            print(f"Date range:           {date_range}")
+            print(f"Database size:        {statistics['database_bytes'] / 1024**3:.2f} GiB")
+            return 0
+        if arguments.command == "archive-update":
+            credentials = AlpacaCredentials.from_environment()
+            symbols = (
+                list_archive_symbols(arguments.database)
+                if arguments.all_symbols
+                else arguments.symbols.split(",")
+            )
+            start = arguments.start or next_update_start(arguments.database, symbols)
+            end = arguments.end or (date.today() - timedelta(days=1)).isoformat()
+            print(f"Requesting daily bars for {len(symbols):,} symbols: {start} through {end}")
+            client = AlpacaMarketDataClient(credentials)
+            bars = client.fetch_daily_bars(
+                symbols,
+                start=start,
+                end=end,
+                feed=arguments.feed,
+                batch_size=arguments.batch_size,
+            )
+            merged = merge_provider_daily_bars(arguments.database, bars)
+            print(f"Rows merged:          {merged['rows_merged']:,}")
+            print(f"Symbols updated:      {merged['symbols_updated']:,}")
+            return 0
+        if arguments.command == "demo":
+            prices = generate_demo_prices(rows=arguments.rows, seed=arguments.seed)
+        elif arguments.command == "archive-analyze":
+            prices = load_daily_prices(
+                arguments.database,
+                arguments.ticker,
+                start=arguments.start,
+                end=arguments.end,
+            )
+        else:
+            prices = load_prices(arguments.csv_file)
+
+        analysis = analyze_prices(prices)
+        result = run_backtest(
+            analysis,
+            initial_cash=arguments.initial_cash,
+            transaction_cost_bps=arguments.transaction_cost_bps,
+        )
+        if arguments.output:
+            destination = save_csv(analysis, arguments.output)
+            print(f"Analysis saved to:    {destination}")
+        latest = analysis.iloc[-1]
+        _print_summary(result, str(latest["signal"]), int(latest["signal_score"]))
+        return 0
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+        return 2
