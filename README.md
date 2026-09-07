@@ -258,3 +258,15 @@ python -m compileall -q src tests
 python -m unittest discover -s tests -v
 ```
 
+The tests cover archive migration from folders and ZIP files, indicator
+calculations, signal warm-up and repeatability, input validation, next-bar
+execution, transaction costs, CSV round trips, and the CLI.
+
+## Security
+
+This repository deliberately contains no brokerage integration and needs no
+credentials. See [SECURITY.md](SECURITY.md) for the credential-handling policy.
+
+## License
+
+Released under the [MIT License](LICENSE).
