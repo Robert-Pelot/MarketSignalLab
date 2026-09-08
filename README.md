@@ -23,6 +23,10 @@ backtesting practices—not to operate a brokerage account.
 - Validated and normalized OHLCV CSV input
 - Streaming migration of thousands of legacy per-ticker files into DuckDB
 - Full-resolution raw storage plus consistent daily bars for analysis
+- Resumable one-minute SIP/IEX/OTC history with coverage checkpoints
+- Regular-session 5-, 15-, and 60-minute research datasets
+- Backward-looking normalized features and next-bar prediction targets
+- Leakage-aware rolling walk-forward logistic-regression evaluation
 - Bollinger Bands with normalized percent-B
 - Relative Strength Index using Wilder smoothing
 - MACD line, signal line, and histogram
@@ -241,9 +245,64 @@ The one-minute layer is intentionally separate:
 - `provider_minute_update_log` records committed batch totals.
 - `daily_prices` remains the stable input for the existing daily analysis.
 
-Later versions can derive consistent 5-minute, 15-minute, hourly, and daily
-features from the one-minute layer and can append live bars from a WebSocket
-collector.
+The research workflow below derives consistent 5-, 15-, and 60-minute features
+from this layer. A later version can append live bars from a WebSocket collector.
+
+## Intraday prediction research
+
+The first prediction-research workflow uses the consistent one-minute provider
+layer rather than the mixed-frequency legacy files. It keeps only the regular US
+equity session from 9:30 a.m. through 4:00 p.m. America/New_York time and can
+materialize 5-, 15-, or 60-minute bars. The source minute table is never changed.
+
+Build the recommended 15-minute dataset:
+
+```powershell
+python -m market_signal_lab research-build `
+  ".\data\market-history.duckdb" `
+  --interval 15 `
+  --feed sip `
+  --start 2025-09-08 `
+  --end 2026-09-07
+```
+
+The generated `research_features_15m` table contains OHLCV bars, source-minute
+coverage, normalized price and volume behavior, RSI, volatility, moving-average
+distance, and cyclical time-of-day features. Every feature is available when its
+bar closes. The target is the following adjacent bar's open-to-close return, so
+the code never treats a same-bar closing price as an executable earlier price.
+
+Run the chronological baseline:
+
+```powershell
+python -m market_signal_lab research-evaluate `
+  ".\data\market-history.duckdb" `
+  --interval 15 `
+  --train-sessions 126 `
+  --test-sessions 21 `
+  --holdout-sessions 21 `
+  --target-move-bps 5 `
+  --confidence 0.55 `
+  --transaction-cost-bps 5 `
+  --output ".\reports\walk-forward-15m.csv"
+```
+
+Each fold trains on approximately six earlier trading months and evaluates the
+following month. The newest 21 sessions are reserved and are not scored, fitted,
+or used for model selection. Scaling and logistic-regression fitting occur inside
+each fold using its training rows only. Moves between -5 and +5 basis points are
+excluded from directional scoring so the initial experiment focuses on movement
+larger than the target threshold.
+
+The command reports model accuracy, balanced accuracy, a majority-class
+baseline, a momentum-persistence baseline, high-confidence coverage and
+accuracy, and the average one-bar result after an assumed round-trip cost. The
+last figure is an independent-signal diagnostic—not a portfolio return—because
+many ticker signals overlap in time. Fold details are saved as CSV for review.
+
+The logistic model is deliberately a transparent baseline, not the final
+algorithm and not evidence of a profitable system. It establishes a repeatable
+measurement floor before testing more complex features or models.
 
 ### Verified legacy snapshot
 
@@ -295,18 +354,21 @@ liquidity. Past simulated performance does not predict future results.
 
 ## Prediction research roadmap
 
-The current score is an explainable heuristic, not a claim that future movement
-has been predicted. A defensible prediction experiment will define both a time
-horizon and a target before model selection—for example, whether the return over
-the next 5, 15, 30, or 60 minutes exceeds a cost-aware threshold.
+The original combined score remains an explainable heuristic. The intraday
+logistic model is a measured baseline, not a claim that future movement has been
+solved. The initial research target is whether the next 15-minute open-to-close
+return exceeds a cost-aware threshold in either direction.
 
 Evaluation must remain chronological:
 
-1. Train on an earlier rolling window, initially six to twelve months.
-2. Select settings on the next validation period.
-3. Predict a later month that neither training nor tuning has seen.
-4. Move the window forward and repeat across multiple market conditions.
-5. Reserve the newest period as a final untouched test.
+1. Establish the 50-symbol baseline with six-month training and one-month tests.
+2. Compare 5-, 15-, and 60-minute horizons without choosing from test results.
+3. Add an explicit validation period for feature and model selection.
+4. Expand to 300–500 symbols and measure performance across liquidity groups.
+5. Repeat across multiple market regimes and reserve the newest period as a
+   final untouched test.
+6. Build a portfolio simulation only after the independent-signal results are
+   stable, including spread, turnover, concurrent positions, and drawdown.
 
 Raw directional accuracy is not enough. Results should also report class
 balance, precision and recall, probability calibration, return after costs,
@@ -331,7 +393,9 @@ MarketSignalLab/
 │   ├── cli.py
 │   ├── demo.py
 │   ├── indicators.py
+│   ├── intraday.py
 │   ├── io.py
+│   ├── research.py
 │   └── signals.py
 ├── tests/
 ├── CONTRIBUTING.md
@@ -348,9 +412,10 @@ python -m unittest discover -s tests -v
 ```
 
 The tests cover archive migration from folders and ZIP files, resumable minute
-backfills, Alpaca pagination and timeframe selection, indicator calculations,
-signal warm-up and repeatability, input validation, next-bar execution,
-transaction costs, CSV round trips, and the CLI.
+backfills, Alpaca pagination and timeframe selection, regular-session filtering,
+intraday aggregation, adjacent next-bar targets, chronological walk-forward
+folds, indicator calculations, signal warm-up and repeatability, input
+validation, next-bar execution, transaction costs, CSV round trips, and the CLI.
 
 ## Security
 

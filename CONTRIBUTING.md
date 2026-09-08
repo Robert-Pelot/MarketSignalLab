@@ -6,7 +6,9 @@ welcome.
 ## Local checks
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[dev]"
+python -m ruff format --check .
+python -m ruff check .
 python -m compileall -q src tests
 python -m unittest discover -s tests -v
 python -m market_signal_lab demo
