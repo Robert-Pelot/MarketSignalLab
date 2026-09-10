@@ -27,6 +27,7 @@ from market_signal_lab.intraday import (
 )
 from market_signal_lab.io import load_prices, save_csv
 from market_signal_lab.research import (
+    FEATURE_SETS,
     SUPPORTED_INTERVALS,
     build_research_dataset,
     evaluate_walk_forward,
@@ -124,6 +125,12 @@ def _build_parser() -> argparse.ArgumentParser:
     research_evaluate.add_argument("--train-sessions", type=int, default=126)
     research_evaluate.add_argument("--test-sessions", type=int, default=21)
     research_evaluate.add_argument("--holdout-sessions", type=int, default=21)
+    research_evaluate.add_argument(
+        "--feature-set",
+        choices=tuple(FEATURE_SETS),
+        default="baseline",
+        help="Features to evaluate: baseline or baseline plus normalized technical indicators",
+    )
     research_evaluate.add_argument("--target-move-bps", type=float, default=5.0)
     research_evaluate.add_argument("--confidence", type=float, default=0.55)
     research_evaluate.add_argument("--transaction-cost-bps", type=float, default=5.0)
@@ -281,7 +288,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Research table:       {result.table}")
             print(f"Interval:             {result.interval_minutes} minutes")
             print(f"Regular-session bars: {result.bars:,}")
-            print(f"Feature-ready rows:   {result.feature_ready_rows:,}")
+            print(f"Baseline-ready rows:  {result.feature_ready_rows:,}")
+            print(f"Technical-ready rows: {result.technical_ready_rows:,}")
             print(f"Symbols:              {result.symbols:,}")
             print(f"Trading sessions:     {result.sessions:,}")
             print(f"Session range:        {result.first_session} through {result.last_session}")
@@ -293,15 +301,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 train_sessions=arguments.train_sessions,
                 test_sessions=arguments.test_sessions,
                 holdout_sessions=arguments.holdout_sessions,
+                feature_set=arguments.feature_set,
                 target_move_bps=arguments.target_move_bps,
                 confidence=arguments.confidence,
                 transaction_cost_bps=arguments.transaction_cost_bps,
             )
-            output = arguments.output or Path(f"reports/walk-forward-{arguments.interval}m.csv")
+            output = arguments.output or Path(
+                f"reports/walk-forward-{arguments.interval}m-{arguments.feature_set}.csv"
+            )
             output.parent.mkdir(parents=True, exist_ok=True)
             result.folds.to_csv(output, index=False)
+            symbol_output = output.with_name(f"{output.stem}-symbols{output.suffix}")
+            coefficient_output = output.with_name(f"{output.stem}-coefficients{output.suffix}")
+            result.symbols.to_csv(symbol_output, index=False)
+            result.coefficients.to_csv(coefficient_output, index=False)
             metrics = result.metrics
             print("Walk-forward baseline")
+            print(
+                f"Feature set:          {metrics['feature_set']} ({metrics['features']} features)"
+            )
             print(f"Folds:                {metrics['folds']:,}")
             print(f"Unseen test rows:     {metrics['test_rows']:,}")
             print(f"Model accuracy:       {100 * metrics['accuracy']:.2f}%")
@@ -322,10 +340,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Signal coverage:      {metrics['confident_coverage_pct']:.2f}%")
             print(f"Confident accuracy:   {100 * metrics['confident_accuracy']:.2f}%")
             print(
+                "Average gross outcome:"
+                f" {metrics['average_gross_bps_per_confident_signal']:+.2f} bps/signal"
+            )
+            print(
                 "Average net outcome:  "
                 f"{metrics['average_net_bps_per_confident_signal']:+.2f} bps/signal"
             )
             print(f"Fold report:          {output}")
+            print(f"Symbol report:        {symbol_output}")
+            print(f"Coefficient report:   {coefficient_output}")
             print("Educational research only; no orders are submitted.")
             return 0
         if arguments.command == "demo":

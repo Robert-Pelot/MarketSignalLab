@@ -27,6 +27,7 @@ backtesting practices—not to operate a brokerage account.
 - Regular-session 5-, 15-, and 60-minute research datasets
 - Backward-looking normalized features and next-bar prediction targets
 - Leakage-aware rolling walk-forward logistic-regression evaluation
+- Baseline-versus-technical feature experiments with fold, symbol, and coefficient reports
 - Bollinger Bands with normalized percent-B
 - Relative Strength Index using Wilder smoothing
 - MACD line, signal line, and histogram
@@ -255,36 +256,60 @@ layer rather than the mixed-frequency legacy files. It keeps only the regular US
 equity session from 9:30 a.m. through 4:00 p.m. America/New_York time and can
 materialize 5-, 15-, or 60-minute bars. The source minute table is never changed.
 
-Build the recommended 15-minute dataset:
+Build a five-minute dataset for the baseline-versus-technical comparison:
 
 ```powershell
 python -m market_signal_lab research-build `
   ".\data\market-history.duckdb" `
-  --interval 15 `
+  --interval 5 `
   --feed sip `
   --start 2025-09-08 `
   --end 2026-09-07
 ```
 
-The generated `research_features_15m` table contains OHLCV bars, source-minute
-coverage, normalized price and volume behavior, RSI, volatility, moving-average
-distance, and cyclical time-of-day features. Every feature is available when its
-bar closes. The target is the following adjacent bar's open-to-close return, so
-the code never treats a same-bar closing price as an executable earlier price.
+The generated `research_features_5m` table contains OHLCV bars, source-minute
+coverage, and two feature sets:
 
-Run the chronological baseline:
+| Feature set | Contents |
+| --- | --- |
+| `baseline` | Returns, range, close location, volume, volatility, 20-period trend, RSI, bar coverage, and time of day |
+| `technical` | Every baseline feature plus normalized 50-period trend, Bollinger Bands, MACD, ATR, stochastic oscillator, OBV pressure, Chaikin Money Flow, VWAP distance, and trade-count activity |
+
+Every feature is available when its bar closes. Price-level indicators are
+normalized so a model can compare different securities. The target is the
+following adjacent bar's open-to-close return, so the code never treats a
+same-bar closing price as an executable earlier price.
+
+Run the chronological baseline first:
 
 ```powershell
 python -m market_signal_lab research-evaluate `
   ".\data\market-history.duckdb" `
-  --interval 15 `
+  --interval 5 `
+  --feature-set baseline `
   --train-sessions 126 `
   --test-sessions 21 `
   --holdout-sessions 21 `
   --target-move-bps 5 `
   --confidence 0.55 `
   --transaction-cost-bps 5 `
-  --output ".\reports\walk-forward-15m.csv"
+  --output ".\reports\walk-forward-5m-baseline.csv"
+```
+
+Then repeat the same experiment with the original technical-analysis ideas:
+
+```powershell
+python -m market_signal_lab research-evaluate `
+  ".\data\market-history.duckdb" `
+  --interval 5 `
+  --feature-set technical `
+  --train-sessions 126 `
+  --test-sessions 21 `
+  --holdout-sessions 21 `
+  --target-move-bps 5 `
+  --confidence 0.55 `
+  --transaction-cost-bps 5 `
+  --output ".\reports\walk-forward-5m-technical.csv"
 ```
 
 Each fold trains on approximately six earlier trading months and evaluates the
@@ -296,9 +321,19 @@ larger than the target threshold.
 
 The command reports model accuracy, balanced accuracy, a majority-class
 baseline, a momentum-persistence baseline, high-confidence coverage and
-accuracy, and the average one-bar result after an assumed round-trip cost. The
-last figure is an independent-signal diagnostic—not a portfolio return—because
-many ticker signals overlap in time. Fold details are saved as CSV for review.
+accuracy, and average gross and cost-adjusted one-bar outcomes. The latter are
+independent-signal diagnostics—not portfolio returns—because many ticker
+signals overlap in time.
+
+Each run writes three reports:
+
+- the requested CSV contains fold-by-fold accuracy, coverage, and gross/net outcomes;
+- a sibling `-symbols.csv` file shows whether results are broad or concentrated by ticker;
+- a sibling `-coefficients.csv` file ranks standardized model weights and their stability.
+
+Compare the two feature sets on the same dates and parameters. A technical
+feature is useful only if it improves results across multiple unseen folds and
+symbols after costs—not merely the combined headline accuracy.
 
 The logistic model is deliberately a transparent baseline, not the final
 algorithm and not evidence of a profitable system. It establishes a repeatable

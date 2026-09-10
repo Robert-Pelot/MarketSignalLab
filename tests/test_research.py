@@ -4,10 +4,14 @@ from datetime import timedelta
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 from market_signal_lab.research import (
     FEATURE_COLUMNS,
+    FEATURE_SETS,
+    TECHNICAL_FEATURE_COLUMNS,
+    _add_research_features,
     build_research_dataset,
     evaluate_walk_forward,
     load_research_dataset,
@@ -70,6 +74,8 @@ class ResearchDatasetTests(unittest.TestCase):
             self.assertEqual(dataset.iloc[0]["source_minutes"], 3)
             self.assertAlmostEqual(dataset.iloc[0]["future_return"], 103 / 102 - 1)
             self.assertTrue(pd.isna(dataset.iloc[1]["future_return"]))
+            self.assertTrue(set(FEATURE_SETS["technical"]).issubset(dataset.columns))
+            self.assertEqual(result.technical_ready_rows, 0)
 
     def test_rejects_unsupported_interval(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -77,9 +83,37 @@ class ResearchDatasetTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Interval"):
                 build_research_dataset(database, interval_minutes=30)
 
+    def test_technical_features_do_not_use_future_bars(self):
+        timestamps = pd.date_range("2026-01-05 09:30:00", periods=70, freq="5min")
+        bars = pd.DataFrame(
+            {
+                "ticker": "AAA",
+                "timestamp": timestamps,
+                "session_date": timestamps.date,
+                "open": np.linspace(100, 110, len(timestamps)),
+                "high": np.linspace(101, 111, len(timestamps)),
+                "low": np.linspace(99, 109, len(timestamps)),
+                "close": np.linspace(100.5, 110.5, len(timestamps)),
+                "volume": np.arange(len(timestamps)) + 100,
+                "trade_count": np.arange(len(timestamps)) + 10,
+                "vwap": np.linspace(100.25, 110.25, len(timestamps)),
+                "source_minutes": 5,
+            }
+        )
+        original = _add_research_features(bars, 5)
+        changed = bars.copy()
+        changed.loc[changed.index[-1], ["open", "high", "low", "close", "vwap"]] *= 10
+        recalculated = _add_research_features(changed, 5)
+
+        earlier = len(bars) - 2
+        pd.testing.assert_series_equal(
+            original.loc[earlier, list(TECHNICAL_FEATURE_COLUMNS)],
+            recalculated.loc[earlier, list(TECHNICAL_FEATURE_COLUMNS)],
+        )
+
 
 class WalkForwardTests(unittest.TestCase):
-    def _dataset(self, sessions: int = 60) -> pd.DataFrame:
+    def _dataset(self, sessions: int = 60, feature_set: str = "baseline") -> pd.DataFrame:
         rows = []
         dates = pd.bdate_range("2026-01-01", periods=sessions)
         for session_index, session in enumerate(dates):
@@ -91,7 +125,7 @@ class WalkForwardTests(unittest.TestCase):
                     "session_date": session.date(),
                     "future_return": direction * 0.001,
                 }
-                for feature_index, feature in enumerate(FEATURE_COLUMNS):
+                for feature_index, feature in enumerate(FEATURE_SETS[feature_set]):
                     row[feature] = direction * (1 + feature_index / 100)
                 rows.append(row)
         return pd.DataFrame(rows)
@@ -112,6 +146,33 @@ class WalkForwardTests(unittest.TestCase):
         self.assertGreater(result.metrics["accuracy"], 0.99)
         self.assertTrue((result.folds["train_end"] < result.folds["test_start"]).all())
         self.assertEqual(len(result.predictions), 180)
+        self.assertEqual(set(result.symbols["ticker"]), {"T0", "T1", "T2"})
+        self.assertEqual(set(result.coefficients["feature"]), set(FEATURE_COLUMNS))
+        self.assertIn("average_gross_bps", result.folds.columns)
+        self.assertIn("average_net_bps", result.folds.columns)
+        self.assertAlmostEqual(
+            result.metrics["average_gross_bps_per_confident_signal"]
+            - result.metrics["average_net_bps_per_confident_signal"],
+            10,
+        )
+
+    def test_walk_forward_supports_normalized_technical_features(self):
+        result = evaluate_walk_forward(
+            self._dataset(feature_set="technical"),
+            train_sessions=20,
+            test_sessions=10,
+            holdout_sessions=10,
+            feature_set="technical",
+            target_move_bps=5,
+        )
+
+        self.assertEqual(result.metrics["feature_set"], "technical")
+        self.assertEqual(result.metrics["features"], len(FEATURE_SETS["technical"]))
+        self.assertEqual(set(result.coefficients["feature"]), set(FEATURE_SETS["technical"]))
+
+    def test_walk_forward_rejects_unknown_feature_set(self):
+        with self.assertRaisesRegex(ValueError, "Feature set"):
+            evaluate_walk_forward(self._dataset(), feature_set="unknown")
 
     def test_walk_forward_requires_enough_sessions(self):
         with self.assertRaisesRegex(ValueError, "sessions are required"):

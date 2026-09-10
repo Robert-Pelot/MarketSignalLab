@@ -13,4 +13,4 @@ __all__ = [
     "load_daily_prices",
     "run_backtest",
 ]
-__version__ = "1.2.0"
+__version__ = "1.3.0"

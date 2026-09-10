@@ -20,10 +20,18 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from market_signal_lab.indicators import relative_strength_index
+from market_signal_lab.indicators import (
+    average_true_range,
+    bollinger_bands,
+    chaikin_money_flow,
+    moving_average_convergence_divergence,
+    on_balance_volume,
+    relative_strength_index,
+    stochastic_oscillator,
+)
 
 SUPPORTED_INTERVALS = (5, 15, 60)
-FEATURE_COLUMNS = (
+BASE_FEATURE_COLUMNS = (
     "intrabar_return",
     "return_1",
     "return_4",
@@ -38,6 +46,27 @@ FEATURE_COLUMNS = (
     "minute_sin",
     "minute_cos",
 )
+TECHNICAL_FEATURE_COLUMNS = (
+    "sma_ratio_50",
+    "bollinger_percent_b",
+    "bollinger_bandwidth",
+    "macd_pct",
+    "macd_signal_pct",
+    "macd_histogram_pct",
+    "atr_pct",
+    "stochastic_k",
+    "stochastic_d",
+    "obv_pressure_4",
+    "cmf_20",
+    "vwap_distance",
+    "trade_count_ratio_20",
+)
+FEATURE_SETS = {
+    "baseline": BASE_FEATURE_COLUMNS,
+    "technical": BASE_FEATURE_COLUMNS + TECHNICAL_FEATURE_COLUMNS,
+}
+# Backward-compatible name for code that imported the original baseline columns.
+FEATURE_COLUMNS = BASE_FEATURE_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -47,6 +76,7 @@ class ResearchDatasetResult:
     interval_minutes: int
     bars: int
     feature_ready_rows: int
+    technical_ready_rows: int
     symbols: int
     sessions: int
     first_session: date
@@ -60,6 +90,8 @@ class WalkForwardResult:
 
     folds: pd.DataFrame
     predictions: pd.DataFrame
+    symbols: pd.DataFrame
+    coefficients: pd.DataFrame
     metrics: dict[str, object]
 
 
@@ -77,6 +109,14 @@ def _validate_date(value: str | None, label: str) -> str | None:
         return pd.Timestamp(value).date().isoformat()
     except (TypeError, ValueError) as error:
         raise ValueError(f"{label} must use YYYY-MM-DD format") from error
+
+
+def _feature_columns(feature_set: str) -> tuple[str, ...]:
+    try:
+        return FEATURE_SETS[feature_set]
+    except KeyError as error:
+        choices = ", ".join(FEATURE_SETS)
+        raise ValueError(f"Feature set must be one of: {choices}") from error
 
 
 def _aggregate_regular_session_bars(
@@ -182,8 +222,56 @@ def _add_research_features(bars: pd.DataFrame, interval_minutes: int) -> pd.Data
     target_bar_end = next_timestamp + np.timedelta64(interval_minutes, "m")
     adjacent = (gap_seconds == interval_minutes * 60) & (target_bar_end <= session_close)
     result["future_return"] = (next_close / next_open - 1).where(adjacent)
+    _add_technical_features(result)
     result.replace([np.inf, -np.inf], np.nan, inplace=True)
     return result
+
+
+def _add_technical_features(result: pd.DataFrame) -> None:
+    """Add normalized versions of the original technical indicators in place."""
+    for column in TECHNICAL_FEATURE_COLUMNS:
+        result[column] = np.nan
+
+    for indices in result.groupby("ticker", sort=False).groups.values():
+        prices = result.loc[indices, ["open", "high", "low", "close", "volume"]].rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            }
+        )
+        close = prices["Close"]
+        sma_50 = close.rolling(50, min_periods=50).mean()
+        bollinger = bollinger_bands(close)
+        macd = moving_average_convergence_divergence(close)
+        stochastic = stochastic_oscillator(prices)
+        obv = on_balance_volume(close, prices["Volume"])
+        recent_volume = prices["Volume"].rolling(4, min_periods=4).sum().replace(0, np.nan)
+
+        result.loc[indices, "sma_ratio_50"] = (close / sma_50 - 1).to_numpy()
+        result.loc[indices, "bollinger_percent_b"] = bollinger["bollinger_percent_b"].to_numpy()
+        result.loc[indices, "bollinger_bandwidth"] = (
+            (bollinger["bollinger_upper"] - bollinger["bollinger_lower"])
+            / bollinger["bollinger_mid"].replace(0, np.nan)
+        ).to_numpy()
+        result.loc[indices, "macd_pct"] = (macd["macd"] / close).to_numpy()
+        result.loc[indices, "macd_signal_pct"] = (macd["macd_signal"] / close).to_numpy()
+        result.loc[indices, "macd_histogram_pct"] = (macd["macd_histogram"] / close).to_numpy()
+        result.loc[indices, "atr_pct"] = (average_true_range(prices) / close).to_numpy()
+        result.loc[indices, "stochastic_k"] = (stochastic["stochastic_k"] / 100).to_numpy()
+        result.loc[indices, "stochastic_d"] = (stochastic["stochastic_d"] / 100).to_numpy()
+        result.loc[indices, "obv_pressure_4"] = (obv.diff(4) / recent_volume).to_numpy()
+        result.loc[indices, "cmf_20"] = chaikin_money_flow(prices).to_numpy()
+
+    result["vwap_distance"] = result["close"] / result["vwap"].replace(0, np.nan) - 1
+    trade_count_average = result.groupby("ticker", sort=False)["trade_count"].transform(
+        lambda values: values.rolling(20, min_periods=20).mean()
+    )
+    result["trade_count_ratio_20"] = (
+        result["trade_count"] / trade_count_average.replace(0, np.nan) - 1
+    )
 
 
 def build_research_dataset(
@@ -268,11 +356,15 @@ def build_research_dataset(
     finally:
         connection.close()
 
-    ready = features[list(FEATURE_COLUMNS) + ["future_return"]].notna().all(axis=1)
+    baseline_ready = features[list(BASE_FEATURE_COLUMNS) + ["future_return"]].notna().all(axis=1)
+    technical_ready = (
+        features[list(FEATURE_SETS["technical"]) + ["future_return"]].notna().all(axis=1)
+    )
     return ResearchDatasetResult(
         interval_minutes=interval_minutes,
         bars=len(features),
-        feature_ready_rows=int(ready.sum()),
+        feature_ready_rows=int(baseline_ready.sum()),
+        technical_ready_rows=int(technical_ready.sum()),
         symbols=int(features["ticker"].nunique()),
         sessions=int(features["session_date"].nunique()),
         first_session=first_session,
@@ -311,12 +403,14 @@ def evaluate_walk_forward(
     train_sessions: int = 126,
     test_sessions: int = 21,
     holdout_sessions: int = 21,
+    feature_set: str = "baseline",
     target_move_bps: float = 5.0,
     confidence: float = 0.55,
     transaction_cost_bps: float = 5.0,
 ) -> WalkForwardResult:
     """Evaluate a logistic baseline using rolling, strictly chronological folds."""
-    required = {"ticker", "timestamp", "session_date", "future_return", *FEATURE_COLUMNS}
+    feature_columns = _feature_columns(feature_set)
+    required = {"ticker", "timestamp", "session_date", "future_return", *feature_columns}
     missing = sorted(required - set(dataset.columns))
     if missing:
         raise ValueError(f"Missing research columns: {', '.join(missing)}")
@@ -333,7 +427,7 @@ def evaluate_walk_forward(
     if transaction_cost_bps < 0:
         raise ValueError("Transaction cost cannot be negative")
 
-    columns = ["ticker", "timestamp", "session_date", "future_return", *FEATURE_COLUMNS]
+    columns = ["ticker", "timestamp", "session_date", "future_return", *feature_columns]
     data = dataset[columns].replace([np.inf, -np.inf], np.nan).dropna().copy()
     threshold = target_move_bps / 10_000
     data = data[(data["future_return"] > threshold) | (data["future_return"] < -threshold)]
@@ -353,6 +447,7 @@ def evaluate_walk_forward(
     holdout_rows = int(data["session_date"].isin(holdout_dates).sum())
     folds: list[dict[str, object]] = []
     prediction_frames: list[pd.DataFrame] = []
+    coefficient_rows: list[dict[str, object]] = []
     test_offset = train_sessions
     fold_number = 0
     while test_offset < len(evaluation_sessions):
@@ -378,8 +473,8 @@ def evaluate_walk_forward(
                 ),
             ]
         )
-        model.fit(train[list(FEATURE_COLUMNS)], train["target_up"])
-        probability = model.predict_proba(test[list(FEATURE_COLUMNS)])[:, 1]
+        model.fit(train[list(feature_columns)], train["target_up"])
+        probability = model.predict_proba(test[list(feature_columns)])[:, 1]
         predicted = (probability >= 0.5).astype(int)
         persistence = (test["return_1"].to_numpy() > 0).astype(int)
         action = np.where(
@@ -396,6 +491,16 @@ def evaluate_walk_forward(
         fold_number += 1
         y_test = test["target_up"].to_numpy()
         confident = action != 0
+        if confident.any():
+            fold_gross_bps = float(
+                np.mean(
+                    action[confident] * test.loc[confident, "future_return"].to_numpy() * 10_000
+                )
+            )
+            fold_net_bps = fold_gross_bps - 2 * transaction_cost_bps
+        else:
+            fold_gross_bps = float("nan")
+            fold_net_bps = float("nan")
         folds.append(
             {
                 "fold": fold_number,
@@ -415,7 +520,18 @@ def evaluate_walk_forward(
                     if confident.any()
                     else np.nan
                 ),
+                "average_gross_bps": fold_gross_bps,
+                "average_net_bps": fold_net_bps,
             }
+        )
+        coefficients = model.named_steps["model"].coef_[0]
+        coefficient_rows.extend(
+            {
+                "fold": fold_number,
+                "feature": feature,
+                "coefficient": float(coefficient),
+            }
+            for feature, coefficient in zip(feature_columns, coefficients, strict=True)
         )
         test_offset += test_sessions
 
@@ -428,15 +544,66 @@ def evaluate_walk_forward(
     majority_accuracy = max(float(target.mean()), 1 - float(target.mean()))
     if confident.any():
         confident_accuracy = accuracy_score(target[confident], (action[confident] == 1).astype(int))
-        net_bps = (
+        gross_bps = (
             action[confident] * predictions.loc[confident, "future_return"].to_numpy() * 10_000
-            - 2 * transaction_cost_bps
         )
+        net_bps = gross_bps - 2 * transaction_cost_bps
+        average_gross_bps = float(gross_bps.mean())
         average_net_bps = float(net_bps.mean())
     else:
         confident_accuracy = float("nan")
+        average_gross_bps = float("nan")
         average_net_bps = float("nan")
+    symbol_rows: list[dict[str, object]] = []
+    for ticker, ticker_rows in predictions.groupby("ticker", sort=True):
+        ticker_target = ticker_rows["target_up"].to_numpy()
+        ticker_prediction = ticker_rows["predicted_up"].to_numpy()
+        ticker_action = ticker_rows["action"].to_numpy()
+        ticker_confident = ticker_action != 0
+        if ticker_confident.any():
+            ticker_confident_accuracy = accuracy_score(
+                ticker_target[ticker_confident],
+                (ticker_action[ticker_confident] == 1).astype(int),
+            )
+            ticker_gross_bps = float(
+                np.mean(
+                    ticker_action[ticker_confident]
+                    * ticker_rows.loc[ticker_confident, "future_return"].to_numpy()
+                    * 10_000
+                )
+            )
+            ticker_net_bps = ticker_gross_bps - 2 * transaction_cost_bps
+        else:
+            ticker_confident_accuracy = float("nan")
+            ticker_gross_bps = float("nan")
+            ticker_net_bps = float("nan")
+        symbol_rows.append(
+            {
+                "ticker": ticker,
+                "test_rows": len(ticker_rows),
+                "accuracy": accuracy_score(ticker_target, ticker_prediction),
+                "confident_rows": int(ticker_confident.sum()),
+                "confident_accuracy": ticker_confident_accuracy,
+                "average_gross_bps": ticker_gross_bps,
+                "average_net_bps": ticker_net_bps,
+            }
+        )
+
+    raw_coefficients = pd.DataFrame(coefficient_rows)
+    coefficient_summary = (
+        raw_coefficients.groupby("feature", as_index=False)
+        .agg(
+            mean_coefficient=("coefficient", "mean"),
+            mean_absolute_coefficient=("coefficient", lambda values: values.abs().mean()),
+            coefficient_std=("coefficient", "std"),
+            positive_fold_pct=("coefficient", lambda values: 100 * (values > 0).mean()),
+        )
+        .sort_values("mean_absolute_coefficient", ascending=False)
+        .reset_index(drop=True)
+    )
     metrics: dict[str, object] = {
+        "feature_set": feature_set,
+        "features": len(feature_columns),
         "folds": len(folds),
         "test_rows": len(predictions),
         "accuracy": float(accuracy_score(target, predicted)),
@@ -451,6 +618,7 @@ def evaluate_walk_forward(
         "confident_rows": int(confident.sum()),
         "confident_coverage_pct": float(100 * confident.mean()),
         "confident_accuracy": float(confident_accuracy),
+        "average_gross_bps_per_confident_signal": average_gross_bps,
         "average_net_bps_per_confident_signal": average_net_bps,
         "holdout_sessions": len(holdout_dates),
         "holdout_rows": holdout_rows,
@@ -460,5 +628,9 @@ def evaluate_walk_forward(
     return WalkForwardResult(
         folds=pd.DataFrame(folds),
         predictions=predictions,
+        symbols=pd.DataFrame(symbol_rows).sort_values(
+            ["average_net_bps", "confident_rows"], ascending=[False, False], na_position="last"
+        ),
+        coefficients=coefficient_summary,
         metrics=metrics,
     )
